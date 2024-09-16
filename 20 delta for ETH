@@ -1,0 +1,193 @@
+import asyncio
+import websockets
+import json
+import ssl
+from datetime import datetime, timedelta
+import pandas as pd
+
+# Запрос для получения списка опционов
+msg_instruments = {
+    "method": "public/get_instruments",
+    "params": {
+        "currency": "ETH",
+        "kind": "option"
+    },
+    "jsonrpc": "2.0",
+    "id": 1
+}
+
+# Tекущее значения индекса ETH/USD
+msg_index = {
+    "method": "public/get_index_price",
+    "params": {
+        "index_name": "eth_usd"
+    },
+    "jsonrpc": "2.0",
+    "id": 2
+}
+
+
+# API с увеличенным тайм-аутом и повторными попытками
+async def call_api(msg, timeout=30, retries=3):
+    ssl_context = ssl._create_unverified_context()  # Отключение проверки SSL
+    attempt = 0
+    while attempt < retries:
+        try:
+            async with websockets.connect('wss://www.deribit.com/ws/api/v2', ssl=ssl_context) as websocket:
+                await websocket.send(msg)
+                response = await asyncio.wait_for(websocket.recv(), timeout)
+                return json.loads(response)
+        except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosedError) as e:
+            attempt += 1
+            print(f"Attempt {attempt} failed: {e}")
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(2)  # Ждем перед повторной попыткой
+
+
+# Получение данных для инструмента с помощью public/get_order_book
+async def get_order_book_for_instrument(instrument_name):
+    msg_orderbook = {
+        "method": "public/get_order_book",
+        "params": {
+            "instrument_name": instrument_name
+        },
+        "jsonrpc": "2.0",
+        "id": 4
+    }
+    response = await call_api(json.dumps(msg_orderbook))
+    if response:
+        return response
+    return None
+
+
+# Получение последней сделки (mark price) для инструмента с использованием /public/get_last_trades_by_instrument_and_time
+async def get_last_trade_price(instrument_name, end_timestamp):
+    msg_last_trades = {
+        "method": "public/get_last_trades_by_instrument_and_time",
+        "params": {
+            "instrument_name": instrument_name,
+            "end_timestamp": end_timestamp,
+            "count": 1  # Запрашиваем только одну последнюю сделку
+        },
+        "jsonrpc": "2.0",
+        "id": 6
+    }
+    response = await call_api(json.dumps(msg_last_trades))
+    if response and 'result' in response:
+        trades = response['result']['trades']
+        if trades:
+            # Возвращаем mark price последней сделки
+            return trades[-1].get('price')
+    return None
+
+
+# База
+async def run_analysis():
+    # Шаг 1: Получаем текущее значение индекса BTC/USD
+    response_index = await call_api(json.dumps(msg_index))
+    if not response_index or 'result' not in response_index:
+        print("Failed to retrieve index data.")
+        print("Response received:", response_index)
+        return
+
+    current_index = response_index['result'].get('index_price')
+    if current_index is None:
+        print("Index price not found in the response.")
+        print("Response received:", response_index)
+        return
+
+    print(f"Current ETH/USD Index Price: {current_index}")
+
+    # Шаг 2: Получаем список инструментов
+    response_instruments = await call_api(json.dumps(msg_instruments))
+    if not response_instruments:
+        print("Failed to retrieve instruments data.")
+        return
+
+    instruments = response_instruments.get('result', [])
+    filtered_instruments = []
+    current_timestamp = int(datetime.now().timestamp() * 1000)
+    max_expiration_timestamp = current_timestamp + (20 * 24 * 60 * 60 * 1000)
+
+    # Фильтрация инструментов по `expiration_timestamp`, `settlement_period`, и отклонению страйков от индекса
+    for instrument in instruments:
+        expiration_timestamp = instrument.get('expiration_timestamp', 0)
+        settlement_period = instrument.get('settlement_period', '')
+        strike = instrument.get('strike', None)
+        creation_timestamp = instrument.get('creation_timestamp', 0)  # Получаем creation_timestamp
+
+        # Условие на соответствие сроку истечения, период расчёта и диапазон страйков
+        if (expiration_timestamp <= max_expiration_timestamp and
+                settlement_period in ['week', 'month'] and
+                strike is not None and
+                (current_index * 0.7) <= strike <= (current_index * 1.3)):
+            filtered_instruments.append({
+                'Instrument Name': instrument.get('instrument_name', ''),
+                'Creation Timestamp': creation_timestamp,
+                'Expiration Timestamp': expiration_timestamp,
+                'Strike': strike
+            })
+
+    # Шаг 3: Данные для каждого инструмента с помощью public/get_order_book и сохраняем в DataFrame
+    data = []
+
+    # Вычисление временных интервалов для каждого инструмента
+    timestamp_24h_ago = current_timestamp - (24 * 60 * 60 * 1000)
+    timestamp_12h_ago = current_timestamp - (12 * 60 * 60 * 1000)
+    timestamp_8h_ago = current_timestamp - (8 * 60 * 60 * 1000)
+    timestamp_1h_ago = current_timestamp - (1 * 60 * 60 * 1000)
+
+    for instrument in filtered_instruments:
+        orderbook_data = await get_order_book_for_instrument(instrument['Instrument Name'])
+        if orderbook_data and 'result' in orderbook_data:
+            result = orderbook_data['result']
+            greeks = result.get('greeks', {})
+            delta = greeks.get('delta')
+            current_mark_price = result.get('mark_price')  #  текущая mark price
+
+            # Фильтрация по значению delta от -0.2 до -0.05 или от 0.05 до 0.2
+            if delta is not None and (-0.2 <= delta <= -0.05 or 0.05 <= delta <= 0.2):
+                # Запрашиваем историю mark price через метод get_last_trade_price
+                mark_price_24h_ago = await get_last_trade_price(instrument['Instrument Name'], timestamp_24h_ago)
+                mark_price_12h_ago = await get_last_trade_price(instrument['Instrument Name'], timestamp_12h_ago)
+                mark_price_8h_ago = await get_last_trade_price(instrument['Instrument Name'], timestamp_8h_ago)
+                mark_price_1h_ago = await get_last_trade_price(instrument['Instrument Name'], timestamp_1h_ago)
+
+                # Вычисляем процентное изменение
+                change_1h = ((
+                                         current_mark_price - mark_price_1h_ago) / mark_price_1h_ago * 100) if mark_price_1h_ago else None
+                change_24h = ((
+                                          current_mark_price - mark_price_24h_ago) / mark_price_24h_ago * 100) if mark_price_24h_ago else None
+
+                # Добавляем данные в таблицу
+                data.append({
+                    'Instrument Name': instrument['Instrument Name'],
+                    'Delta': delta,
+                    'Current Mark Price': current_mark_price,
+                    'Mark Price (24h ago)': mark_price_24h_ago,
+                    'Mark Price (12h ago)': mark_price_12h_ago,
+                    'Mark Price (8h ago)': mark_price_8h_ago,
+                    'Mark Price (1h ago)': mark_price_1h_ago,
+                    '% Change (1h)': change_1h,
+                    '% Change (24h)': change_24h
+                })
+
+    # Создаем DataFrame и сортируем его по % Change (24h) от большего к меньшему
+    df = pd.DataFrame(data)
+
+    # Удаляем строки, содержащие NaN значения
+    df = df.dropna()
+
+    # Сортируем таблицу по % Change (24h)
+    df = df.sort_values(by='% Change (24h)', ascending=False)
+
+
+    # Настройка отображения всех столбцов
+    pd.set_option('display.max_columns', None)  # Показывать все столбцы
+    pd.set_option('display.width', None)  # Автоматически подгонять ширину под содержимое
+    print(df)
+
+
+# Запуск функции
+asyncio.run(run_analysis())
